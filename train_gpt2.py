@@ -9,6 +9,17 @@ from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 # -----------------------------------------------------------------------------
 
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+gas1 = False
+B = 64 # micro batch size
+mixed = True
+
+# -----------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -72,9 +83,9 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of heads
-    n_embd: int = 768 # embedding dimension
+    n_layer: int = 48 # number of layers
+    n_head: int = 25 # number of heads
+    n_embd: int = 1500 # embedding dimension
 
 class GPT(nn.Module):
 
@@ -274,11 +285,6 @@ def get_most_likely_row(tokens, mask, logits):
     pred_norm = avg_loss.argmin().item()
     return pred_norm
 
-# -----------------------------------------------------------------------------
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -322,10 +328,11 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if gas1:
+    grad_accum_steps = 1
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
@@ -339,7 +346,6 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -377,108 +383,6 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
-
-    # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
-
-    # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
-
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
@@ -489,7 +393,10 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        if mixed:
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+        else:
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().

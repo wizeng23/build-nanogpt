@@ -24,12 +24,13 @@ gpt2-xl (1558M)
 
 The validation set of HellaSwag has a total of 10,042 examples.
 """
-
+import re
 import os
 import json
 import requests
 import tiktoken
 from tqdm import tqdm
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -37,6 +38,7 @@ from transformers import GPT2LMHeadModel
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
+_PREFIX_CHECKPOINT_DIR = "checkpoint"
 
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
@@ -111,67 +113,107 @@ def render_example(example):
 
 def iterate_examples(split):
     # there are 10,042 examples in total in val
-    download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
         for line in f:
             example = json.loads(line)
             yield example
 
+def _get_checkpoints(checkpoint_dir):
+    """Returns all checkpoints in the target directory."""
+    # Modified from HF's transformers.trainer_utils.get_last_checkpoint().
+    re_checkpoint = re.compile(r"^" + _PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
+    directory_list = os.listdir(checkpoint_dir)
+    checkpoints = [
+        os.path.join(checkpoint_dir, path)
+        for path in directory_list
+        if re_checkpoint.search(path) is not None
+        and os.path.isdir(os.path.join(checkpoint_dir, path))
+    ]
+    return sorted(checkpoints)
+
+def get_checkpoint_number(checkpoint):
+    dash=checkpoint.rfind('-')
+    num = checkpoint[dash+1:]
+    if num[-1] == '/':
+        num = num[:-1]
+    return num
+
 @torch.no_grad()
-def evaluate(model_type, device):
-
+def evaluate(comp, device):
+    download('val')
     torch.set_float32_matmul_precision('high') # use tf32
-    model = GPT2LMHeadModel.from_pretrained(model_type)
-    model.to(device)
-    # model = torch.compile(model) # optionally torch compile the model
 
-    num_correct_norm = 0
-    num_correct = 0
-    num_total = 0
-    for example in iterate_examples("val"):
-        data, tokens, mask, label = render_example(example)
-        tokens = tokens.to(device)
-        mask = mask.to(device)
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "/output_dir_gcs/wizeng/log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log_mixed.txt")
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
 
-        # get the logits
-        logits = model(tokens).logits
-        # evaluate the autoregressive loss at all positions
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-        shift_losses = shift_losses.view(tokens.size(0), -1)
-        # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-        masked_shift_losses = shift_losses * shift_mask
-        # sum and divide by the number of 1s in the mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-        # now we have a loss for each of the 4 completions
-        # the one with the lowest loss should be the most likely
-        pred = sum_loss.argmin().item()
-        pred_norm = avg_loss.argmin().item()
+    checkpoint_dir = "checkpoints"
+    checkpoints = _get_checkpoints(checkpoint_dir)
+    print(f"Found {len(checkpoints)} checkpoints")
 
-        # accumulate stats
-        num_total += 1
-        num_correct += int(pred == label)
-        num_correct_norm += int(pred_norm == label)
-        print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
+    model_type = ''
+    for checkpoint in checkpoints:
+        checkpoint_num = get_checkpoint_number(checkpoint)
+        model = GPT2LMHeadModel.from_pretrained(checkpoint)
+        model.to(device)
+        if comp:
+            model = torch.compile(model) # optionally torch compile the model
+        num_correct_norm = 0
+        num_correct = 0
+        num_total = 0
+        t = time.time()
+        for example in iterate_examples("val"):
+            data, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
 
-        # debug: pretty print a few examples, and the losses in each case
-        if num_total < 10:
-            print("---")
-            print(f"Context:\n {example['ctx']}")
-            print(f"Endings:")
-            for i, end in enumerate(example["endings"]):
-                print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
-            print(f"predicted: {pred_norm}, actual: {label}")
+            # get the logits
+            logits = model(tokens).logits
+            # evaluate the autoregressive loss at all positions
+            shift_logits = (logits[..., :-1, :]).contiguous()
+            shift_tokens = (tokens[..., 1:]).contiguous()
+            flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            flat_shift_tokens = shift_tokens.view(-1)
+            shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+            shift_losses = shift_losses.view(tokens.size(0), -1)
+            # now get the average loss just for the completion region (where mask == 1), in each row
+            shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+            masked_shift_losses = shift_losses * shift_mask
+            # sum and divide by the number of 1s in the mask
+            sum_loss = masked_shift_losses.sum(dim=1)
+            avg_loss = sum_loss / shift_mask.sum(dim=1)
+            # now we have a loss for each of the 4 completions
+            # the one with the lowest loss should be the most likely
+            pred = sum_loss.argmin().item()
+            pred_norm = avg_loss.argmin().item()
+
+            # accumulate stats
+            num_total += 1
+            num_correct += int(pred == label)
+            num_correct_norm += int(pred_norm == label)
+        acc_norm = num_correct_norm/num_total
+        print(f"{checkpoint_num}\t{acc_norm:.4f}\t{time.time() - t}")
+        t=time.time()
+        with open(log_file, "a") as f:
+            f.write(f"{checkpoint_num}\t{acc_norm:.4f}\n")
+            # print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
+
+        # # debug: pretty print a few examples, and the losses in each case
+        # if num_total < 10:
+        #     print("---")
+        #     print(f"Context:\n {example['ctx']}")
+        #     print(f"Endings:")
+        #     for i, end in enumerate(example["endings"]):
+        #         print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
+        #     print(f"predicted: {pred_norm}, actual: {label}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--model_type", type=str, default="gpt2", help="the model type to use")
+    parser.add_argument("-c", "--compile", type=bool, default=False, help="compile the model")
     parser.add_argument("-d", "--device", type=str, default="cuda", help="the device to use")
     args = parser.parse_args()
-    evaluate(args.model_type, args.device)
+    evaluate(args.compile, args.device)
