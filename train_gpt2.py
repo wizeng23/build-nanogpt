@@ -18,9 +18,10 @@ import numpy as np
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 gas1 = False
 B = 64 # micro batch size
-mixed = True
+mixed = False
 non_blocking = False
 set_fp32_precision = False
+bf16 = True
 
 # -----------------------------------------------------------------------------
 # simple launch:
@@ -294,6 +295,8 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 
 def main():
+    if bf16:
+        torch.set_default_dtype(torch.bfloat16)
     # set up DDP (distributed data parallel).
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
